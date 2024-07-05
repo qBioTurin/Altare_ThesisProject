@@ -1,0 +1,2574 @@
+---
+title: "Final script"
+author: "Leandro Altare"
+date: "`r Sys.Date()`"
+output: pdf_document
+always_allow_html: true
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r pressure, echo=FALSE}
+library(ggvenn)
+library(broom)
+library(readxl)
+library(tidyverse)
+library(plotrix)
+library(ggpointdensity)
+library(tidyselect)
+library(GGally)
+library(viridis)
+library(janitor)
+library(fmsb)
+library(scales)
+library(BiocManager)
+library(phyloseq)
+library(biomformat)
+library(RColorBrewer)
+library(patchwork)
+library(gridExtra)
+library(grid)
+library(scatterplot3d)
+library(metagenomeSeq)
+library(akima)
+library(mgcv)
+library(DESeq2)
+library(decontam)
+library(reshape2)
+library(dendextend)
+library(pheatmap)
+library(plotly)
+library(vegan)
+library(knitr)
+library(kableExtra)
+library(gt)
+
+# Tree testings
+library(BiocManager)
+library(ggtree)
+library(ape)
+library(data.tree)
+library(tidytree)
+
+```
+
+# Custom functions
+
+## Data cleaning
+
+### reorder_samples()
+
+Obj: reordering the samples of the metadata based on their appearence in the OTU tab.
+Input: Metadata and phyloseq with OTU table
+Output: reordered Metadata and number of reordered entries, prior and after the reordering. If fails it report a console argument with the possible mismatching names.
+
+```{r,echo=FALSE}
+
+reorder_samples <- function(sample, physeq) {
+  # Set row names of 'sample' to column names of 'physeq'
+  rownames(sample) <- colnames(physeq@otu_table@.Data)
+  
+  # Get 'id' column from 'sample'
+  ids <- sample[,"id"]
+  
+  # Split row names of 'sample' on underscore
+  split_names <- strsplit(rownames(sample), "_")
+  
+  # Extract the first part of each row name
+  first_parts <- sapply(split_names, `[`, 1)
+  
+  # Find which ids are not present in first_parts
+  ids_not_in_first_parts <- ids[!ids %in% first_parts]
+  
+  # Find which first_parts are not present in ids
+  first_parts_not_in_ids <- first_parts[!first_parts %in% ids]
+  
+  # Combine the two vectors
+  combined <- data.frame(ids_not_in_first_parts, first_parts_not_in_ids)
+  
+  print(combined)
+  
+  # If there are any mismatches, stop the function and return 'combined'
+  if (NROW(combined) > 0) {
+    return(combined)
+  }
+  else{
+  
+  # Check if the first part of each row name matches the corresponding 'id'
+  matches <- first_parts == ids
+  
+  # Print the number of mismatches
+  print(sum(matches == FALSE))
+  
+  # If there are any mismatches, reorder 'sample'
+  if (sum(matches == FALSE) > 0) {
+    # Create a named vector where names are 'id' and values are row names
+    name_vector <- setNames(rownames(sample), sample[,"id"])
+    
+    # Reorder 'sample' based on the order of 'first_parts'
+    sample <- sample[name_vector[first_parts], ]
+    
+    # Set row names of 'sample' to column names of 'physeq' again
+    rownames(sample) <- colnames(physeq@otu_table@.Data)
+    
+    nsample<-sample
+    
+    # Get 'id' column from 'sample'
+    nids <- nsample[,"id"]
+    
+    # Split row names of 'sample' on underscore
+    nsplit_names <- strsplit(rownames(nsample), "_")
+    
+    # Extract the first part of each row name
+    nfirst_parts <- sapply(nsplit_names, `[`, 1)
+    
+    # Check if the first part of each row name matches the corresponding 'id'
+    nmatches <- nfirst_parts == nids
+    
+    # Print the number of mismatches
+    print(sum(nmatches == FALSE))
+    
+    # Return 'sample'
+    return(nsample)
+  }
+  else{
+  # Return 'sample'
+  return(sample)}
+  }
+}
+```
+
+### Clean_excess_letters()
+
+Obj:removes letters from all the TAX table entries up to the specified number
+Input: Phyloseq, number of the desired starting letter
+Output: Phyloseq with updated Tax
+
+```{r,echo=FALSE}
+Clean_excess_letters<-function(databiom,Starting_letter){
+  databiom@tax_table@.Data <- substring(databiom@tax_table@.Data, Starting_letter)
+  colnames(databiom@tax_table@.Data)<-
+    c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  return(databiom)
+}
+```
+
+### check_species_vs_nrow()
+
+Obj: checks if the n of species unique entries matches the n of rows 
+Input: Phyloseq
+Output: explicit logical information
+
+```{r,echo=FALSE}
+check_Species_vs_nrow<-function(data){
+  are_identical<-identical(nrow(data@tax_table@.Data),
+                           length(unique(data@tax_table@.Data[,"Species"])))
+  return(print(are_identical))
+  }
+```
+
+### Set_unique_species()
+
+Obj: Consequential to previous function, looks for closest taxa and attaches it within [] close to all their related repeated species name 
+Input: Phyloseq
+Output: Phyloseq with corrected tax table
+
+```{r,echo=FALSE}
+Set_unique_species<-function(data){
+  
+  num_levels<-ncol(data@tax_table@.Data)
+  
+  # Start from the species level and go up to the genus level
+  for (level in (num_levels-1):1) {
+    # Check if the number of unique taxa at this level is equal to the number of rows
+    are_identical <- identical(nrow(data@tax_table@.Data),
+                               length(unique(data@tax_table@.Data[,"Species"])))
+    
+    # If they are not identical, add the higher taxonomic level to the taxa name
+    if (!are_identical) {
+      # Get the taxa with frequency >= 2
+      multi_tax_table <- as.data.frame(table(data@tax_table@.Data[,"Species"]))
+      multi_tax_table <- multi_tax_table[multi_tax_table[,2] >= 2,]
+      
+      # Find the rows in the tax table that match the filtered taxa
+      matching_rows <- data@tax_table@.Data[,"Species"] %in% multi_tax_table[,1]
+      
+      # Add the higher taxonomic level in [] before the taxa name
+      data@tax_table@.Data[,"Species"][matching_rows] <- paste0(
+        "[", data@tax_table@.Data[,level][matching_rows], "] ",
+        data@tax_table@.Data[,"Species"][matching_rows])
+    }
+  }
+  
+  return(data)
+}
+```
+
+
+### fill_blanks()
+
+Obj: checks for NA within the Tax table and assignes closest taxa 
+Input: Phyloseq
+Output: Phyloseq with Filled Tax table
+
+```{r,echo=FALSE}
+fill_blanks <- function(databiom) {
+  data <- databiom@tax_table@.Data
+  data <- as.data.frame(data)
+  
+  # Find rows that contain blanks or NA in the 3rd, 4th, or 5th column
+  rows_with_blanks <- which(apply(
+    data[, 3:5], 1, function(x) any(is.na(x) | x == "")))
+  
+  # Iterate over each row that contains blanks
+  for (i in rows_with_blanks) {
+    # Find another row with the same "Genus" and no blanks in the 3rd, 4th, or 5th column
+    matching_row <- which(data$Genus == data$Genus[i] & !apply(
+      data[, 3:5],1, function(x) any(is.na(x) | x == "")))
+    
+    # If a matching row is found
+    if (length(matching_row) > 0) {
+      # Replace the entries of the 3rd, 4th, and 5th columns with the
+      # entries from the matching row
+      data[i, 3:5] <- data[matching_row[1], 3:5]
+    }
+  }
+  
+  # Find rows that still contain blanks or NA in the 3rd, 4th, or 5th column
+  rows_with_blanks <- which(apply(data[, 3:5], 1, function(x) any(
+    is.na(x) | x == "")))
+  
+  # Iterate over the 3rd, 4th, and 5th columns in reverse order
+  for (j in rev(3:5)) {
+    # Iterate over each row that still contains blanks
+    for (i in rows_with_blanks) {
+      # If the cell is blank
+      if (is.na(data[i, j]) || data[i, j] == "") {
+        # Replace the blank with the value from the previous column in brackets
+        data[i, j] <- paste0("[", data[i, j+1], "]")
+      }
+    }
+  }
+  
+  # Convert the dataframe back to a matrix
+  matrix_filled <- as.matrix(data)
+  
+  databiom@tax_table@.Data <- matrix_filled
+  return(databiom)
+}
+```
+
+
+### prune_false_positives()
+
+Obj: Checks for OTUs with all 0 rows in the OTU table and cuts them off 
+Input: Phyloseq
+Output: Phyloseq with trimmered OTU table
+
+```{r,echo=FALSE}
+prune_false_positives<-function(physeq){
+  otus_to_keep <- taxa_names(physeq)[taxa_sums(physeq) > 0]
+  pruned.physeq <- prune_taxa(otus_to_keep, physeq)
+  return(pruned.physeq)
+}
+```
+
+## Analysis optimization
+
+### analyze_metadata_healthy.vs.ill()
+
+Obj: Gives general information dividing by healthy or ill (or any factorial subdivision) 
+Input: Phyloseq or df, column for subdivision, 1st factor, 2nd factor
+Output: console Information
+
+```{r,echo=FALSE}
+analyze_metadata_healthy.vs.ill <- function(input,column_category="category",
+                                            h.val="HEALTHY",ill.val="MS") {
+  # Input
+  input_name <- deparse(substitute(input))
+  
+  # Check if input is a phyloseq object
+  if ("phyloseq" %in% class(input)) {
+    sample_df <- data.frame(sample_data(input))
+    cat("Object",input_name,"is phyloseq\n")
+  } else if (is.data.frame(input)) {
+    # If it's a dataframe, use it directly
+    sample_df <- input
+    cat("Object data frame:",input_name,"\n")
+  } else {
+    stop("The input is neither a dataframe nor a phyloseq object.")
+  }
+  
+  healthy_count <- sum(sample_df[[column_category]] == h.val)
+  ms_count <- sum(sample_df[[column_category]] == ill.val)
+  
+  # Number of rows (samples)
+  cat("Number of samples:", nrow(sample_df),"(",h.val,":",healthy_count,
+      ",",ill.val,":",ms_count, ")\n")
+  
+  # Analyze factorial columns
+  factorial_columns <- sapply(sample_df, is.factor)
+  
+  # Number of columns (attributes)
+  cat("Number of attributes:", length(factorial_columns[factorial_columns]), "\n",
+      "(",h.val,"vs",ill.val,")\n")
+  
+  for (col_name in names(factorial_columns[factorial_columns])) {
+    # Get levels and their counts
+    level_counts <- table(sample_df[[col_name]])
+    
+    # Display the column name and categories
+    cat("\n", col_name, "- categories:")
+    
+    # Display each level and its count
+    for (level in names(level_counts)) {
+      cat("\n", level, ", value: ", level_counts[[level]])
+      
+      # Select rows where column equals level
+      selected_rows <- sample_df[sample_df[,col_name] == level &
+                                   !is.na(sample_df[,col_name]), ]
+      
+      # Calculate the percentage of "HEALTHY" and "MS" for the current level
+      level.healthy_count <- nrow(selected_rows[selected_rows[,column_category] == h.val,])
+      level.ms_count <- nrow(selected_rows[selected_rows[,column_category] == ill.val,])
+      
+      healthy_percentage <- round(level.healthy_count/healthy_count * 100,1)
+      ms_percentage <- round(level.ms_count/ms_count * 100,1)
+      
+      cat(" (", healthy_percentage, "%","vs",ms_percentage,"% )")
+    }
+    cat("\n Total samples",sum(level_counts),"\n")
+  }
+}
+```
+
+### report_phyloseq_data()
+
+Obj: Gives general information 
+Input: Phyloseq
+Output: console Information
+
+```{r,echo=FALSE}
+report_phyloseq_data <- function(biom) {
+  
+  # Extract tax and otu
+  Tot_tax_table_data <- data.frame(tax_table(biom))
+  Tot_otu_table_data <- data.frame(otu_table(biom))
+  
+  # Data
+  input_name <- deparse(substitute(biom))
+  Total_species <- nrow(Tot_tax_table_data)
+  Total_reads <- sum(Tot_otu_table_data)
+  
+  # Cat
+  cat("Phyloseq:", input_name, "\nTotal Species present:", Total_species, "\nTotal reads:", Total_reads, "\n")
+  
+  # Unique kingdoms
+  unique_Kingdom <- unique(Tot_tax_table_data$Kingdom)
+  
+  # Kingdom loop
+  for (Kingdoms in unique_Kingdom) {
+    
+    # Recalculate tax and otu for the filtered kingdom
+    Kingdom_tax_table_data <- Tot_tax_table_data[
+      Tot_tax_table_data$Kingdom == Kingdoms, ]
+    Kingdom_otu_table_data <- Tot_otu_table_data[
+      rownames(Tot_otu_table_data) %in% rownames(Kingdom_tax_table_data), ]
+    
+    # Calculate species and reads for the current kingdom
+    Kingdom_species <- nrow(Kingdom_tax_table_data)
+    Kingdom_reads <- round(sum(Kingdom_otu_table_data)/Total_reads*100,2)
+    
+    # Initialize lists for each kingdom
+    species_list <- list()
+    sum_list <- list()
+    
+    # Column loop
+    for (col in colnames(Kingdom_otu_table_data)) {
+      Species_by_sample <- nrow(Kingdom_otu_table_data[Kingdom_otu_table_data[, col] > 0, , drop = FALSE])
+      species_list[[col]] <- Species_by_sample
+      
+      column_by_sample <- Kingdom_otu_table_data %>%
+        dplyr::select(!!rlang::sym(col))
+      Reads_by_sample <- colSums(column_by_sample)
+      sum_list[[col]] <- Reads_by_sample
+    }
+    
+    # Calculate averages for the current kingdom
+    Avg_species_kingdom <- round(mean(unlist(species_list)),0)
+    Avg_sumreads_kingdom <- round(mean(unlist(sum_list)),0)
+    
+    # Print results for the current kingdom
+    cat("\nKingdom:", Kingdoms, "\nTotal species present:", Kingdom_species,
+        " - Total percentage of reads:", Kingdom_reads, "\nAverage Species by sample:",
+        Avg_species_kingdom, " - Average Reads by sample:", Avg_sumreads_kingdom, "\n")
+  }
+}
+```
+
+### report_phyloseq_data_by_category()
+
+Obj: Gives general information divided by category of interest
+Input: Phyloseq and column representing that category
+Output: console Information
+
+```{r,echo=FALSE}
+report_phyloseq_data_by_category <- function(biom,column_category="category") {
+  
+  # Extract tax and otu
+  Tot_tax_table_data <- data.frame(tax_table(biom))
+  Tot_otu_table_data <- data.frame(otu_table(biom))
+  Tot_sample_data<- data.frame(sample_data(biom))
+  # Data
+  input_name <- deparse(substitute(biom))
+  
+  # Cat
+  cat("Phyloseq:", input_name, "\n")
+  
+  # Unique kingdoms
+  unique_Kingdom <- unique(Tot_tax_table_data$Kingdom)
+  
+  # Kingdom loop
+  for (Kingdoms in unique_Kingdom) {
+    
+    # Recalculate tax and otu for the filtered kingdom
+    Kingdom_tax_table_data <- Tot_tax_table_data[
+      Tot_tax_table_data$Kingdom == Kingdoms, ]
+    Kingdom_otu_table_data <- Tot_otu_table_data[
+      rownames(Tot_otu_table_data) %in% rownames(Kingdom_tax_table_data), ]
+    
+    cat("\nKingdom:", Kingdoms,"\n","Category:",column_category,"\n")
+    
+    unique.groups <- unique(Tot_sample_data[
+      !is.na(Tot_sample_data[,column_category]), column_category])
+    
+    for (grouped in unique.groups) {
+      
+    
+    grouped_sample_data<-Tot_sample_data[Tot_sample_data[,column_category]==grouped,]
+    
+    grouped_otu<-Kingdom_otu_table_data[,colnames(Kingdom_otu_table_data)%in%
+                                          rownames(grouped_sample_data)]
+    
+    # Check if the group contains only one element
+    if (is.null(ncol(grouped_otu))) {
+      grouped_otu<-data.frame(grouped_otu)
+      Total_species<-nrow(grouped_otu)
+      Total_reads<-sum(grouped_otu)
+      # Print total number of species and reads
+      cat("-",grouped,"samples-   total species:", Total_species,
+          ", total reads:",Total_reads, "\n")
+    } else {
+    
+    grouped_list<-list()
+    grouped_sum<-list()
+    
+    # Column loop
+    for (h.col in colnames(grouped_otu)) {
+      Species_by_grouped <- nrow(grouped_otu[grouped_otu[, h.col] > 0, , drop = FALSE])
+      grouped_list[[h.col]] <- Species_by_grouped
+      
+      column_by_grouped <- grouped_otu %>%
+        dplyr::select(!!rlang::sym(h.col))
+      Reads_by_grouped <- colSums(column_by_grouped)
+      grouped_sum[[h.col]] <- Reads_by_grouped
+    }
+    
+    # Calculate averages for the current kingdom
+    Avg_species_grouped <- round(mean(unlist(grouped_list)),0)
+    Avg_sumreads_grouped <- round(mean(unlist(grouped_sum)),0)
+    
+    # Print results for the current kingdom
+    cat("-",grouped,"samples-   avg. species:",Avg_species_grouped,", avg. reads:",
+        Avg_sumreads_grouped,"\n")
+  }
+  }
+  }
+}
+
+```
+
+### run_diversity_analysis()
+
+Obj: applies the wilcoxon.test to each possible combination of Metadata attributes
+Input: Phyloseq and specified diversity index
+Output: console Information
+
+```{r,echo=FALSE}
+run_diversity_analysis <- function(physeq_obj, diversity_index = "Shannon") {
+  # Calculate the diversity indices and add them to the sample data
+  diversity_data <- estimate_richness(physeq_obj, measures = c("Shannon", "Simpson"))
+  sample_data(physeq_obj) <- cbind(sample_data(physeq_obj), diversity_data)
+  
+  # Get the sample data with the new diversity indices
+  sample_df <- data.frame(sample_data(physeq_obj))
+  
+  # Convert factors to characters to ensure labels are used
+  sample_df[] <- lapply(sample_df, function(x) if(is.factor(x)) as.character(x) else x)
+  
+  # Initialize a flag to FALSE
+  significant_difference_found <- FALSE
+
+  run_wilcox <- function(data, variable, group_column) {
+    # Remove rows where the group column is NA
+    data <- data[!is.na(data[[group_column]]), ]
+    
+    # Check if there are at least two unique values to compare
+    unique_values <- unique(data[[group_column]])
+    if (length(unique_values) >= 2 && length(unique_values) != nrow(data))  {
+      # First, run Wilcoxon test for each unique combination of groups
+      group_combinations <- combn(unique_values, 2, simplify = FALSE)
+      for (groups in group_combinations) {
+        # Create a subset of data for the groups to compare
+        subset_data <- data[data[[group_column]] %in% groups, ]
+        test_result <- wilcox.test(reformulate(group_column, response = variable), 
+                                   data = subset_data)
+        if (!is.na(test_result$p.value) && test_result$p.value <= 0.05) {
+          n_group1 <- nrow(subset_data[subset_data[[group_column]] == groups[1], ])
+          n_group2 <- nrow(subset_data[subset_data[[group_column]] == groups[2], ])
+          cat("\nDiversity index:",diversity_index,"- Comparative Analysis",
+              "\n Significant difference for", group_column, "between", 
+              groups[1], "and", groups[2], "with p-value:", test_result$p.value,
+              "\n","Number of observations:", n_group1, "for", groups[1], "and", n_group2,
+              "for", groups[2], "\n")
+          significant_difference_found <<- TRUE
+        }
+      }
+      
+      # Then, run Wilcoxon test for each group against all others
+      for (group in unique_values) {
+        # Create a subset of data for the group and all other groups
+        group_data <- data[data[[group_column]] == group, ]
+        other_groups_data <- data[data[[group_column]] != group, ]
+        combined_data <- rbind(group_data, other_groups_data)
+        combined_data[[group_column]] <- ifelse(combined_data[[group_column]] == group, group, "Other")
+        
+        # Run the Wilcoxon test
+        test_result <- wilcox.test(reformulate(group_column, response = variable), 
+                                   data = combined_data)
+        
+        # Check for significant p-value and print results
+        if (!is.na(test_result$p.value) && test_result$p.value <= 0.05) {
+          n_group <- nrow(group_data)
+          n_other_groups <- nrow(other_groups_data)
+          cat("\nDiversity index:",diversity_index,"- Relative Analysis",
+              "\n Significant difference for",group_column, "between", 
+              group, "and all other groups with p-value:", test_result$p.value,
+              "\n", "Number of observations:", n_group, "for",
+              group, "and", n_other_groups, "for Other groups", "\n")
+          significant_difference_found <<- TRUE
+        }
+      }
+    }
+  }
+  
+  # Run the analysis for each column except the diversity indices and those with unique entries as nrow
+  for (col in setdiff(names(sample_df), c("Shannon", "Simpson"))) {
+    if (length(unique(sample_df[[col]])) != nrow(sample_df)) {
+      run_wilcox(sample_df, diversity_index, col)
+    }
+  }
+  if (!significant_difference_found) {
+    cat("No significant difference with p-value below 0.05 detected by",
+    diversity_index,"Index\n")
+  }
+}
+```
+
+### percentages_over_control()
+
+Obj: Calculates the percentages of a value column of a given df compared to a df control
+Input: Df of interest, Df as control
+Output: Df with new column with percentages
+
+```{r,echo=FALSE}
+percentages_over_control<-function(main_df,control_df,value_col="Reads_median"){
+  percentage_df<-main_df
+  percentage_df$percentage<-percentage_df[[value_col]]/control_df[[value_col]]*100
+  return(percentage_df)
+}
+
+```
+
+### Taxa_plus_otu_median()
+
+Obj: 1st step of zoom functions. Converts Phyloseq to df
+with Taxa and reads median column 
+Input: Phyloseq
+Output: df
+
+```{r,echo=FALSE}
+taxa_plus_otu_median <- function(physeq, tax_col) {
+  # Get the OTU table
+  otu <- otu_table(physeq)
+  
+  # Calculate the median reads
+  reads_median <- round(apply(otu, 1, median),0)
+  
+  # Get the tax values
+  tax_values <- tax_table(physeq)[,tax_col]
+  
+  # Create the dataframe
+  df <- data.frame(
+    Taxa = tax_values,
+    Reads_median = reads_median
+  )
+  
+  # Rename the column
+  colnames(df)[1] <- tax_col
+  
+  # Group by taxonomic column and sum the median values
+  df <- df %>%
+    group_by(!!sym(tax_col)) %>%
+    summarise(Reads_median = sum(Reads_median))
+  
+  return(df)
+}
+```
+
+### Sum_process_taxa_Presence()
+
+Obj: 2nd step of zoom functions, combines into a df a list of dfs designes as the output of previous function
+Input: list of df
+Output: Combined df with Presence column for reference (1 for unique entries)
+
+```{r,echo=FALSE}
+Sum_Process_taxa_Presence <- function(df_list) {
+  
+  # Add a new column 'Presence' to each data frame in the list
+  df_list <- lapply(df_list, function(df) {
+    df$Presence <- 1
+    return(df)
+  })
+  
+  df <- bind_rows(df_list)
+  
+  group_cols <- names(df)[1:(ncol(df)-2)]  # Exclude the last two columns
+  
+  sum_cols <- names(df)[(ncol(df)-1):ncol(df)]  
+  
+  sum_df <- df %>%
+    group_by_at(group_cols) %>%
+    summarise_at(vars(sum_cols), sum, na.rm = TRUE)
+  
+  return(sum_df)
+}
+```
+
+### Filter_by_match()
+
+Obj: 3rd step, selects matching species or mismatching ones between a list 
+Input: Previous combined df, original df list, Operation either == (match) or != (mismatch)
+Output: listof original dfs but with only matching or mismatching Taxa
+
+```{r,echo=FALSE}
+Filter_by_match <- function(combined_df, df_list, Taxa="Species", Operation,reads_sum="Reads_median") {
+  
+  num_elements <- length(df_list)
+  
+  if (Operation == "!=") {
+    combined_df_filtered <- combined_df %>% filter(Presence != num_elements)
+    
+    df_list <- lapply(df_list, function(x) {
+      x[x[[Taxa]] %in% combined_df_filtered[[Taxa]], ]
+    })
+    
+    df_list <- lapply(df_list, function(x) {
+      missing_rows <- combined_df_filtered[!combined_df_filtered[[Taxa]] %in% x[[Taxa]], ]
+      missing_rows[[reads_sum]] <- 0
+      bind_rows(x, missing_rows)
+    })
+    
+  } else if (Operation == "==") {
+    combined_df_filtered <- combined_df %>% filter(Presence == num_elements)
+    
+    df_list <- lapply(df_list, function(x) {
+      x[x[[Taxa]] %in% combined_df_filtered[[Taxa]], ]
+    })
+  }
+  
+  filtered_df_list <- lapply(df_list, function(x) {
+    if ("Presence" %in% names(x)) {
+      x %>% select(-Presence)
+    } else {
+      x
+    }
+  })
+  
+  return(filtered_df_list)
+}
+```
+
+## Complex visualization
+
+### alpha_diversity_plot()
+
+Obj: Exhaustive box plots for alpha diversity divided by healthy or ill (or similar)
+Input: Phyloseq, variable to investigate, Index of diversity, column for division
+Output: boxplot and df with diversity index scores
+
+```{r,echo=FALSE}
+alpha_diversity_plot<-function(phyloseq,Variable_class,Diversity="Shannon",
+                               major_group_col="category",omit.main=NULL,omit.minor=NULL,
+                               color=NULL,labels_legend=NULL){
+  
+  
+  otu_data <- data.frame(otu_table(phyloseq))
+  tax_data <- data.frame(tax_table(phyloseq))
+  sample_data <- data.frame(sample_data(phyloseq))
+  
+  # set uniques for healthy vs ill
+  comparable_vec<- unique(sample_data[[major_group_col]])
+  
+  # omit if omittable
+  if (!is.null(omit.main)){
+    comparable_vec[comparable_vec==omit.main]<-NA
+    comparable_NA<-comparable_vec
+  } else {comparable_NA<-comparable_vec}
+  
+  # Use na.omit() to remove NA values
+  comparable_no_NA <- na.omit(comparable_NA)
+  
+  # Or use logical indexing with is.na()
+  comparable <- comparable_no_NA[!is.na(comparable_no_NA)]
+  
+  # Attribute
+  attribute_vec<- unique(sample_data[[Variable_class]])
+  
+  # omit if omittable
+  if (!is.null(omit.minor)){
+    attribute_vec[attribute_vec==omit.main]<-NA
+    attribute_NA<-attribute_vec
+  } else {attribute_NA<-attribute_vec}
+  
+  # Use na.omit() to remove NA values
+  attribute_no_NA <- na.omit(attribute_NA)
+  
+  # Or use logical indexing with is.na()
+  attribute_cleared <- attribute_no_NA[!is.na(attribute_no_NA)]
+  
+  # Get the levels of Variable_class
+  levels <- levels(attribute_cleared)
+  
+  # Reorder attribute based on the levels of Variable_class
+  attribute <- attribute_cleared[match(levels, attribute_cleared)]
+  
+  Total_list<-list()
+  for (comparison in comparable){
+    # Filter sample data based on specifications
+    df_major <- sample_data[
+      sample_data[[major_group_col]] == comparison
+      & !is.na(sample_data[[major_group_col]]),]
+    
+    Minor_list<-list()
+    
+    for (Group_specifics in attribute) {
+      
+      # Filter sample data based on specifications
+      df_minor <- df_major[
+        df_major[[Variable_class]] == Group_specifics
+        & !is.na(df_major[[Variable_class]]),]
+      
+      if (nrow(df_minor) > 1) {
+        # Select columns in OTU table corresponding to filtered sample data
+        otu_minor <- as.matrix(otu_data[
+          , colnames(otu_data) %in% rownames(df_minor)])
+        
+        # Select rows in taxonomy table corresponding to filtered OTU table
+        tax_minor <- as.matrix(tax_data[
+          rownames(tax_data)%in% rownames(otu_minor), ])
+        
+        # Merge filtered OTU and taxonomy data back into a new phyloseq object
+        final_df <- phyloseq(otu_table(otu_minor, taxa_are_rows = TRUE),
+                             tax_table(tax_minor),
+                             sample_data(df_minor))
+        
+        rich_df <- estimate_richness(final_df,measures = Diversity)
+        
+        rich_df$group<-paste0(comparison,"_",Group_specifics)
+        
+        rich_df$id<-rownames(rich_df)
+        
+        colnames(rich_df)<-c("Value","Group","ID")
+        
+        # list them
+        Minor_list[[Group_specifics]]<-rich_df
+        
+      } else {
+        alternative_df<-data.frame(Value=c(NA,NA),Group=c(
+          paste0(comparison,"_",Group_specifics),paste0(comparison,"_",Group_specifics)),
+          ID=c(NA,NA))
+        Minor_list[[Group_specifics]]<-alternative_df
+      }
+    }
+    
+    Total_list[[comparison]]<-Minor_list
+    
+  }
+  
+  Mid_list<-lapply(Total_list,function (df) do.call(rbind,df))
+  
+  results_df<-do.call(rbind,Mid_list)
+  
+  if (is.null(color)){
+    # color vector
+    color_vec<-c("Blues","Reds","Greens","Purples","Greys")
+  } else {
+    color_vec<-color
+  }
+  Main_colors_number<-1:length(comparable)
+  color_list<-list()
+  for(i in Main_colors_number) {
+    # Get the elements of Total_list[[i]] that have at least one non-NA value
+    non_na_elements <- sapply(Total_list[[i]], function(x) any(!is.na(x$Value)))
+    
+    # Calculate the length of only the elements in Total_list[[i]] which have at least one non-NA value within
+    non_na_length <- sum(non_na_elements)
+    
+    if (non_na_length >= 3) {
+      color_df <- rev(RColorBrewer::brewer.pal(non_na_length, color_vec[i]))
+    } else {
+      color_df_pre <- rev(RColorBrewer::brewer.pal(non_na_length, color_vec[i]))
+      color_df <- color_df_pre[1:non_na_length]
+    }
+    color_list[[i]] <- color_df
+  }
+  
+  colors<-unlist(color_list)
+  
+  # Get the order of the groups
+  group_order <- unique(results_df$Group)
+  
+  # Set the levels of Group in the order we want
+  results_df$Group <- factor(results_df$Group, levels = group_order)
+  
+  
+  p<-ggplot(results_df, aes(x = Group, y = Value, fill = Group)) +
+    geom_boxplot(color = "black") +
+    theme_minimal() +
+    scale_fill_manual(values=colors)+
+    labs(title = paste0(Diversity," Alpha Diversity by ",major_group_col," for ",
+                        Variable_class), x = "", y = "") + 
+    theme(axis.text.x = element_blank(), # Remove x-axis text
+          axis.ticks.x = element_blank()) +
+    guides(fill = guide_legend(title = "Group Description"))
+  
+  if (!is.null(labels_legend)){
+    label<-labels_legend
+    p<-p+scale_fill_manual(values=colors,labels=label)
+  }
+  
+  print(p)
+  
+  return(results_df)
+  
+}
+
+```
+
+### zoom_list_matches()
+
+Obj: 4th step of zoom functions, takes the matching or mismatching df list and sets each df within for zoom visualization
+Input: df list
+Output: organized and zoomed list of df lists
+
+```{r,echo=FALSE}
+zoom_list_matches <- function(df_list,Taxa="Species",reads_sum="Reads_median"){
+  sex_virus_list_match_Element <- lapply(seq_along(df_list), function(i) {
+    df <- df_list[[i]]
+    df$Element <- i
+    df
+  })
+  
+  combined_df <- do.call(rbind, sex_virus_list_match_Element)
+  combined_df$zooms[combined_df[[reads_sum]] == 0] <- "Zoom (10^8)"
+  
+  databiom_non_zero <- combined_df[combined_df[[reads_sum]] != 0,]
+  
+  max_zeros <- floor(log10(max(databiom_non_zero[[reads_sum]])))
+  
+  databiom_non_zero$zooms <- NA
+  
+  for (i in seq(max_zeros, 0, by = -2)) {
+    lower_bound <- 10^i
+    upper_bound <- if(i-2 >= 0) 10^(i-2) else 0
+    
+    databiom_non_zero$zooms[
+      databiom_non_zero[[reads_sum]] >= upper_bound &
+        databiom_non_zero[[reads_sum]]
+      < lower_bound] <- (max_zeros - i)/2 + 1
+  }
+  
+  databiom_non_zero$zooms <- replace_na(databiom_non_zero$zooms, 0)
+  databiom_non_zero$zooms <- paste("Zoom (10^", databiom_non_zero$zooms*2, ")", sep="")
+  
+  combined_df_zoom <- rbind(combined_df[combined_df[[reads_sum]] == 0, ], databiom_non_zero)
+  
+  modified_df <- combined_df_zoom %>%
+    group_by(!!sym(Taxa)) %>%
+    mutate(zooms = ifelse(!!sym(reads_sum) != 0,
+                          zooms[which.max(!!sym(reads_sum))], zooms))
+  
+  modified_df_relative <- modified_df %>%
+    group_by(zooms) %>%
+    mutate(Relative_Reads_sum = max(!!sym(reads_sum)))
+  
+  df_list_modified <- split(modified_df_relative, modified_df_relative$Element)
+  
+  sex_virus_list_match_zoom <- lapply(df_list_modified,function(df) {
+    
+    df_list <- split(df, df$zooms)
+    
+    n <- 100
+    
+    for (i in seq_along(df_list)) {
+      df_list[[i]] <- df_list[[i]] %>% mutate(max_value_by_n = max(df_list[[i]][[
+        "Relative_Reads_sum"]])/n)
+    }
+    
+    for (i in seq_along(df_list)) {
+      df_list[[i]] <- df_list[[i]][rep(seq_len(nrow(df_list[[i]])), each=n),]
+    }
+    
+    for (i in seq_along(df_list)) {
+      df_list[[i]] <- df_list[[i]] %>% 
+        group_by(!!sym(Taxa)) %>% 
+        mutate(progr_sum = cumsum(max_value_by_n)) %>% 
+        ungroup()
+    }
+    
+    for (i in seq_along(df_list)) {
+      df_list[[i]] <- df_list[[i]] %>%
+        group_by(!!sym(Taxa)) %>%
+        mutate(count_col = ifelse(progr_sum > !!sym(reads_sum), 0, progr_sum)) %>%
+        ungroup()
+    }
+    
+    for (i in seq_along(df_list)) {
+      df_list[[i]] <- df_list[[i]] %>%
+        mutate(count_col = replace(count_col, count_col == 0, NA))
+    }
+    
+    for (i in seq_along(df_list)) {
+      df_list[[i]] <- df_list[[i]] %>%
+        mutate(zooms = replace(zooms, TRUE, zooms[1]))
+    }
+    
+    for (i in seq_along(df_list)) {
+      df_list[[i]] <- df_list[[i]] %>%
+        select(zooms,!!sym(Taxa),max_value_by_n,count_col,
+               !!sym(reads_sum),Relative_Reads_sum)
+    }
+    
+    return(df_list)
+  })
+  
+  sex_virus_list_match_zoom <- lapply(sex_virus_list_match_zoom, function(list_df) {
+    do.call(rbind, list_df)
+  })
+  
+  combined_df <- do.call(rbind, sex_virus_list_match_zoom)
+  
+  sex_virus_list_match_zoom <- lapply(seq_along(sex_virus_list_match_zoom), function(i) {
+    df <- sex_virus_list_match_zoom[[i]]
+    df$Element <- i
+    df
+  })
+  
+  combined_df <- do.call(rbind, sex_virus_list_match_zoom)
+  
+  new_rows <- combined_df %>%
+    group_by(Element, zooms) %>%
+    dplyr::slice(1) %>%
+    mutate(!!sym(Taxa) := "",
+           Max_value_by_n = Relative_Reads_sum,
+           count_col = dplyr::first(Relative_Reads_sum),
+           !!sym(reads_sum) := NA,
+           Relative_Reads_sum = dplyr::first(Relative_Reads_sum))
+  
+  modified_df <- bind_rows(combined_df, new_rows)
+  
+  df_list_modified <- split(modified_df, modified_df$Element)
+  df_list_modified <- lapply(df_list_modified,function(df) split(df, df$zooms))
+  
+  return(df_list_modified)
+}
+```
+
+### filter_reads_by_zoom()
+
+Obj: variation of Filter_reads_by_match() and the previous function deigned for non comparison occasions
+Input: df, Taxa col, Value col
+Output: modified df list ready for zoom plot function (need to be listed alone)
+
+```{r,echo=FALSE}
+
+filter_reads_by_zoom <- function(databiom, Taxa, reads_sum) {
+  
+  max_zeros <- floor(log10(max(databiom[[reads_sum]])))
+  
+  databiom$zooms <- NA
+  
+  for (i in seq(max_zeros, 0, by = -2)) {
+    lower_bound <- 10^i
+    upper_bound <- if(i-2 >= 0) 10^(i-2) else 0
+    
+    databiom$zooms[databiom[[reads_sum]] >= upper_bound & databiom[[reads_sum]] < lower_bound] <- (max_zeros - i)/2 + 1
+  }
+  
+  databiom$zooms <- replace_na(databiom$zooms, 0)
+  databiom$zooms <- paste("Zoom (10^", databiom$zooms*2, ")", sep="")
+  
+  df_list <- split(databiom, databiom$zooms)
+  
+  modified_df_list <- list()
+  
+  for (i in 1:(length(df_list) - 1)) {
+    df_current <- df_list[[i]]
+    
+    df_next <- df_list[[i + 1]]
+    
+    max_row_next <- df_next[which.max(df_next[[reads_sum]]), ]
+    
+    df_current <- rbind(df_current, max_row_next)
+    
+    modified_df_list[[i]] <- df_current
+  }
+  
+  modified_df_list[[length(df_list)]] <- df_list[[length(df_list)]]
+  
+  df_list <- modified_df_list
+  
+  n <- 100
+  
+  for (i in seq_along(df_list)) {
+    df_list[[i]] <- df_list[[i]] %>% mutate(max_value_by_n = max(df_list[[i]][[reads_sum]])/n)
+  }
+  
+  for (i in seq_along(df_list)) {
+    df_list[[i]] <- df_list[[i]][rep(seq_len(nrow(df_list[[i]])), each=n),]
+  }
+  
+  for (i in seq_along(df_list)) {
+    df_list[[i]] <- df_list[[i]] %>% 
+      group_by(!!sym(Taxa)) %>% 
+      mutate(progr_sum = cumsum(max_value_by_n)) %>% 
+      ungroup()
+  }
+  
+  for (i in seq_along(df_list)) {
+    df_list[[i]] <- df_list[[i]] %>%
+      group_by(!!sym(Taxa)) %>%
+      mutate(count_col = ifelse(progr_sum > !!sym(reads_sum), 0, progr_sum)) %>%
+      ungroup()
+  }
+  
+  for (i in seq_along(df_list)) {
+    df_list[[i]] <- df_list[[i]] %>%
+      group_by(!!sym(Taxa)) %>%
+      mutate(hit_zero = cumsum(count_col == 0) > 0,
+             count_col = replace(count_col,
+                                count_col == 0 & !lag(hit_zero,
+                                                     default = FALSE), max(!!sym(reads_sum)))) %>%
+      select(-hit_zero) %>%
+      ungroup()
+  }
+  
+  for (i in seq_along(df_list)) {
+    df_list[[i]] <- df_list[[i]] %>%
+      mutate(count_col = replace(count_col, count_col == 0, NA))
+  }
+  
+  for (i in seq_along(df_list)) {
+    df_list[[i]] <- df_list[[i]] %>%
+      mutate(zooms = replace(zooms, TRUE, zooms[1]))
+  }
+  
+  # Reorder groups within each dataframe based on the median value of reads_sum
+  for (i in seq_along(df_list)) {
+    # Calculate the median value of reads_sum for each Taxa group
+    median_values <- df_list[[i]] %>%
+      group_by(!!sym(Taxa)) %>%
+      summarize(median_value = median(!!sym(reads_sum), na.rm = TRUE)) %>%
+      arrange(desc(median_value)) %>%
+      ungroup() # Make sure to ungroup after summarizing
+
+    # Get the ordered Taxa names
+    ordered_taxa <- median_values %>% 
+      pull(!!sym(Taxa))
+
+    # Adjust the levels of Taxa based on the ordered median values
+    df_list[[i]][[Taxa]] <- factor(df_list[[i]][[Taxa]], levels = ordered_taxa)
+
+    # Now the Taxa within each dataframe are ordered by the median value of reads_sum
+  }
+  
+  for (i in seq_along(df_list)) {
+    df_list[[i]] <- df_list[[i]] %>%
+      select(zooms, !!sym(Taxa), max_value_by_n, count_col, !!sym(reads_sum))
+  }
+  
+  return(df_list)
+}
+```
+
+### zoom_lists_zoom_bars()
+
+Obj: Main zoom plot function, last step. Takes a zoomed list and converts the specified element into a list of zoom plots
+Input: df list [[element]], Taxa and column with values
+Output: ZOOM PLOT LIST
+
+```{r,echo=FALSE}
+zoom_list_zoom_bars <- function(
+    df_list, Taxa="Species", text_Reads_sum = NULL,
+    reads_sum = "Reads_median",
+    Title_text="Median of reads",
+    dye = c("darkblue", "skyblue", "green", "yellow", "red")) {
+  
+  color_gradient <- colorRampPalette(dye)
+  
+  plot_list <- list()
+  
+  for (i in seq_along(df_list)) {
+    p <- ggplot(df_list[[i]], aes_string(x = Taxa, y = "max_value_by_n", fill = "count_col")) +
+      geom_col() +
+      scale_fill_gradientn(colors = color_gradient(nrow(df_list[[i]])),
+                           name = "Sum of reads", na.value = "white") +
+      scale_y_continuous(name = "Sum of reads", expand = expansion(mult = c(0, 0.1))) +
+      scale_x_discrete(name = Taxa, labels = function(x) str_wrap(x, width = 10)) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.title = element_text(face = "bold")) +
+      ggtitle(paste(Title_text, "by", unique(df_list[[i]]$zooms)[1]))
+    if (!is.null(text_Reads_sum)) {
+      p <- p + geom_text(aes(label = !!sym(text_Reads_sum),
+                             y = (!!sym(reads_sum)) + ((!!sym(reads_sum)) / (nrow(df_list[[i]])))), size = 3, vjust = -1)
+    }
+    plot_list[[i]] <- p
+  }
+  return(plot_list)
+}
+```
+
+# Data Integration
+
+## Sample Data refining
+
+
+```{r,echo=FALSE}
+# wd
+setwd("C:/Users/Utente/OneDrive/Desktop/Tesi/Script/Tesi scripts")
+
+### sample data
+MetadataHSvsT0_unmodified <- read_csv("20240423_MetadataHSvsT0_modified.csv")
+MetadataHSvsT0_modified<-MetadataHSvsT0_unmodified[
+  MetadataHSvsT0_unmodified[,"naive"]!="no",]
+ MetadataHSvsT0<-as.data.frame(clean_names(MetadataHSvsT0_modified))
+rownames(MetadataHSvsT0)<-MetadataHSvsT0$id
+
+```
+
+```{r}
+# select columns
+HSvs.sample_filtered<- MetadataHSvsT0%>%
+  select(id,category,sequencing_batch,sex,age,bmi,pyr_mds,
+         edss,smoking_habit,physical_activity)%>%
+  mutate(across(c(sequencing_batch,physical_activity,smoking_habit,
+                  category),as.factor))
+
+# create column for decontam
+HSvs.sample_filtered$is_blank <- ifelse(
+  HSvs.sample_filtered$category %in% "NEG",TRUE, FALSE)
+```
+
+### Age_percentile
+
+```{r}
+# Calculate the percentiles
+breaks <- quantile(HSvs.sample_filtered$age, probs = seq(0, 1, by = (1/3)),na.rm=TRUE)
+
+# Create labels for the age ranges
+labels <- paste(round(breaks[-length(breaks)]), round(breaks[-1]), sep="_")
+
+HSvs.sample_filtered$age_percentile <- cut(HSvs.sample_filtered$age, breaks = breaks,
+  include.lowest = TRUE, labels = labels)
+
+HSvs.sample_age_perc<-HSvs.sample_filtered%>%
+  select(-age)
+```
+
+### BMI_class
+
+```{r}
+# BMI Categories Zheng, 2011
+# Calculate the percentiles
+breaks.3 <- quantile(HSvs.sample_age_perc$bmi, probs = seq(0, 1, by = (1/3)),na.rm=TRUE)
+
+# Create labels for the age ranges
+labels.3 <- c("Below-Normal weight","Normal weight","Above-Normal weight")
+
+HSvs.sample_age_perc$BMI_class <- cut(HSvs.sample_age_perc$bmi, breaks = breaks.3,
+  include.lowest = TRUE, labels = labels.3)
+
+HSvs.sample_bmi_class<-HSvs.sample_age_perc%>%
+  select(-bmi)
+```
+
+### pyr_mds
+
+```{r}
+# Calculate the percentiles
+breaks.2 <- quantile(HSvs.sample_bmi_class$pyr_mds,
+                     probs = seq(0, 1, by = 0.5),na.rm=TRUE)
+
+# Create labels for the age ranges
+labels.2 <- paste(round(breaks.2[-length(breaks.2)]), round(breaks.2[-1]), sep="_")
+
+HSvs.sample_bmi_class$pyr_mds_class <- cut(HSvs.sample_bmi_class$pyr_mds,
+                                            breaks = breaks.2,
+  include.lowest = TRUE, labels = labels.2)
+
+HSvs.sample_pyr_mds<-HSvs.sample_bmi_class%>%
+  select(-pyr_mds)%>%
+  mutate(across(pyr_mds_class,as.factor))
+```
+
+
+### EDSS_class (.DOI:10.1186/1471-2377-14-58)
+
+```{r}
+# edss ranges
+edss_categories <- c("Minimal Disability",
+                     "Mild Disability", "High Disability",
+                     "Severe Disability", "Death")
+edss_ranges <- list(c(0, 3.5), c(4, 5.5), c(6, 7.5),
+                    c(8, 9.5),c(10,10))
+
+# Create a new column 'EDSS_class' in the dataframe
+HSvs.sample_pyr_mds$EDSS_class <- sapply(HSvs.sample_pyr_mds$edss, function(EDSS) {
+  if (is.na(EDSS)) {
+    return(NA)  # return NA if EDSS is NA
+  }
+  for (i in seq_along(edss_ranges)) {
+    if (EDSS >= edss_ranges[[i]][1] & EDSS <= edss_ranges[[i]][2]) {
+      return(edss_categories[i])
+    }
+  }
+  return(NA)  # return NA if the EDSS doesn't fall into any of the defined categories
+})
+
+# factorialize
+HSvs.sample_EDSS_class<-HSvs.sample_pyr_mds%>%
+  select(-edss)%>%
+  mutate(across(c(sex,age_percentile,BMI_class,EDSS_class),as.factor))
+```
+
+### Bolum_Intake
+
+```{r}
+# Bolum_Intake column
+HSvs.sample_EDSS_class <- HSvs.sample_EDSS_class %>%
+  mutate(Bolum_Intake = case_when(
+    grepl("MAV", id) | grepl("TEC", id) ~ "positive",
+    grepl("HEALTHY", category) | grepl("NEG", category) ~ "healthy",
+    TRUE ~ "negative"))%>%
+  mutate(across(Bolum_Intake,as.factor))
+
+```
+
+### operator_element
+
+```{r}
+# defy elements
+Starting<-c("1","2","3")
+HSvs.sample_EDSS_class<-HSvs.sample_EDSS_class%>%
+  mutate(operator_element=case_when(sequencing_batch %in% Starting ~ "1-3",
+                                      TRUE ~ "4-5")) %>%
+  select(-sequencing_batch)%>%
+  mutate(across(operator_element,as.factor))
+```
+
+
+## Relevelling factors
+
+```{r}
+# Filter the by the unique values
+age_percentile_order <- levels(HSvs.sample_EDSS_class$age_percentile)
+
+# set the factor levels
+HSvs.sample_EDSS_class$age_percentile <- factor(HSvs.sample_EDSS_class$age_percentile, levels = age_percentile_order)
+
+# Filter the by the unique values
+pyr_mds_order <- levels(HSvs.sample_EDSS_class$pyr_mds_class)
+
+# set the factor levels
+HSvs.sample_EDSS_class$pyr_mds_class <- factor(HSvs.sample_EDSS_class$pyr_mds_class, levels = pyr_mds_order)
+
+# set the factor levels
+HSvs.sample_EDSS_class$BMI_class <- factor(HSvs.sample_EDSS_class$BMI_class,
+                                           levels = labels.3)
+
+# Filter the by the unique values
+filtered_EDSS_classes <- intersect(edss_categories,
+                                  unique(HSvs.sample_EDSS_class$EDSS_class))
+
+# set the factor levels
+HSvs.sample_EDSS_class$EDSS_class <- factor(HSvs.sample_EDSS_class$EDSS_class,
+                                           levels = filtered_EDSS_classes)
+
+# Filter the by the unique values
+Bolum_Intake_classes <- levels(HSvs.sample_EDSS_class$Bolum_Intake)
+
+# set the factor levels
+HSvs.sample_EDSS_class$Bolum_Intake <- factor(HSvs.sample_EDSS_class$Bolum_Intake,
+                                           levels = Bolum_Intake_classes)
+# Filter the by the unique values
+OE_classes <- levels(HSvs.sample_EDSS_class$operator_element)
+
+# set the factor levels
+HSvs.sample_EDSS_class$operator_element <- factor(HSvs.sample_EDSS_class$operator_element,
+                                           levels = OE_classes)
+
+
+```
+
+## Infos metadata
+
+```{r}
+analyze_metadata_healthy.vs.ill(HSvs.sample_EDSS_class)
+```
+
+
+## Otu and tax integration
+
+```{r,echo=FALSE}
+# biom
+Hsvs.biom.full<-import_biom("HSvsMAVTECT0.biom")
+
+# correct names
+
+HSvs_otu<-otu_table(Hsvs.biom.full)
+HSvs_otu<-data.frame(HSvs_otu)
+colnames(HSvs_otu) <- sub("_bracken_species","", colnames(HSvs_otu))
+HSvs_otu<-HSvs_otu[,colnames(HSvs_otu)%in%rownames(HSvs.sample_EDSS_class)]
+
+# merge biom
+Hsvs.biom<-Hsvs.biom.full
+HSvs_otu<-otu_table(HSvs_otu,taxa_are_rows = TRUE)
+otu_table(Hsvs.biom)<-HSvs_otu
+
+# reorder sample
+HSvs.sample_reordered<-reorder_samples(HSvs.sample_EDSS_class,Hsvs.biom)
+
+# merge
+HSvs<-merge_phyloseq(Hsvs.biom,sample_data(HSvs.sample_reordered))
+
+# clean
+HSvs<-HSvs%>%
+  Clean_excess_letters(4)
+check_Species_vs_nrow(HSvs)
+HSvs<-HSvs%>%
+  Set_unique_species()
+check_Species_vs_nrow(HSvs)
+HSvs.fill<-fill_blanks(HSvs)
+```
+
+## normalization
+
+```{r}
+# norm
+HSvs.norm<-HSvs.fill
+dds.HSvs <- phyloseq_to_deseq2(HSvs.norm, ~ 1)
+dds.HSvs <- DESeq(dds.HSvs)
+
+### The normalized counts are stored in the object returned by DESeq
+normalized_counts.HSvs <- round(counts(dds.HSvs, normalized=TRUE),0)
+
+### reconvert to otu
+otu_table(HSvs.norm) <- otu_table(normalized_counts.HSvs, taxa_are_rows = TRUE)
+
+```
+
+
+## Library size comparison
+
+```{r, fig.show="hold", out.width="50%"}
+# Put sample_data into a ggplot-friendly data.frame
+lib.0 <- as.data.frame(sample_data(HSvs.fill)) 
+lib.0$LibrarySize <- sample_sums(HSvs.fill)
+lib.0 <- lib.0[order(lib.0$LibrarySize),]
+lib.0$Index <- seq(nrow(lib.0))
+ggplot(data=lib.0, aes(x=Index, y=LibrarySize, color=is_blank)) + geom_point() +
+  labs(x = "Samples", y = "Size of library", color = "blank sample") +
+  ggtitle("Library size before Normalization")
+
+# Put sample_data into a ggplot-friendly data.frame
+lib.1 <- as.data.frame(sample_data(HSvs.norm)) 
+lib.1$LibrarySize <- sample_sums(HSvs.norm)
+lib.1 <- lib.1[order(lib.1$LibrarySize),]
+lib.1$Index <- seq(nrow(lib.1))
+ggplot(data=lib.1, aes(x=Index, y=LibrarySize, color=is_blank)) + geom_point() +
+  labs(x = "Samples", y = "Size of library", color = "blank sample") +
+  ggtitle("Library size before Normalization")
+```
+
+## Data Infos
+
+```{r}
+report_phyloseq_data(HSvs.norm)
+```
+
+
+## Kingdoms zoom plot
+
+```{r}
+# kingdom zooming
+HSvs.norm_Kingdom<-HSvs.norm%>%
+  taxa_plus_otu_median("Kingdom")
+HSvs.norm_Kingdom<-HSvs.norm_Kingdom[HSvs.norm_Kingdom[,"Reads_median"]>0,]
+
+# Kingdom zoom
+HSvs.norm_Kingdom_zoom<-HSvs.norm_Kingdom%>%
+  filter_reads_by_zoom("Kingdom","Reads_median")
+
+# List it for reasons
+HSvs.norm_Kingdom_zoom_list<-list(HSvs.norm_Kingdom_zoom)
+
+# Plotting function
+Kingdom_plot<-zoom_list_zoom_bars(
+  HSvs.norm_Kingdom_zoom_list[[1]],
+  text_Reads_sum = "Reads_median",Taxa = "Kingdom")
+```
+
+```{r,figures-side-1, fig.show="hold", out.width="33%"}
+plot(Kingdom_plot[[1]])
+plot(Kingdom_plot[[2]])
+plot(Kingdom_plot[[3]])
+```
+
+## decontamination
+
+```{r}
+# decont
+HSvs.norm.decont <- isContaminant(HSvs.norm, method="prevalence",neg="is_blank")
+HSvs.contaminants <- rownames(HSvs.norm.decont)[
+  HSvs.norm.decont$contaminant == TRUE]
+HSvs.n.dec <- prune_taxa(!taxa_names(HSvs.norm) %in% HSvs.contaminants,
+                         HSvs.norm)
+
+```
+
+### contaminants pie + barplot
+
+```{r}
+### contaminants pie
+Hsvs.contaminants.phy<-prune_taxa(taxa_names(HSvs.norm) %in% HSvs.contaminants,
+                                                HSvs.norm)
+
+Hsvs.contaminants.tax<-data.frame(tax_table(Hsvs.contaminants.phy))
+
+Hsvs.contaminants.otu<-data.frame(otu_table(Hsvs.contaminants.phy))
+
+Hsvs.contaminants.K.P<-data.frame(Kingdom=Hsvs.contaminants.tax$Kingdom,
+                                  Phylum=Hsvs.contaminants.tax$Phylum,
+                                  Reads_sum=rowSums(Hsvs.contaminants.otu))
+
+Hsvs.contaminants.K.P.R<-Hsvs.contaminants.K.P %>%
+  group_by(Kingdom, Phylum) %>%
+  summarise(Total_Reads = sum(Reads_sum, na.rm = TRUE)) %>%
+  ungroup()
+
+Hsvs.contaminants.K.P.R <- Hsvs.contaminants.K.P.R %>%
+  arrange(Kingdom, desc(Total_Reads))
+
+# Calcola i totali dei reads per ogni Kingdom per il cerchio esterno
+kingdom_sums <- Hsvs.contaminants.K.P.R %>%
+  group_by(Kingdom) %>%
+  summarise(Kingdom_Total_Reads = sum(Total_Reads)) %>%
+  mutate(Phylum = "All") %>%
+  arrange(Kingdom) %>%
+  select(Kingdom, Phylum, Kingdom_Total_Reads) %>%
+  ungroup()
+
+# Use a left join to match the order of Kingdoms in both data frames
+final_data <- left_join(kingdom_sums, Hsvs.contaminants.K.P.R, by = "Kingdom")
+
+# Ensure the correct palette is assigned to each kingdom
+kingdom_color_palettes <- list("Archaea" = rev(RColorBrewer::brewer.pal(8, "Purples")),
+  "Bacteria" = rev(RColorBrewer::brewer.pal(8, "YlOrBr")),
+  "Eukaryota" = rev(RColorBrewer::brewer.pal(8, "RdPu")),
+  "Viruses" = rev(RColorBrewer::brewer.pal(8, "Greys")))
+
+# Adjusted function to assign colors starting from the second color in the palette
+assign_colors <- function(df, palettes) {
+  # Initialize a vector to store colors
+  colors <- rep(NA, nrow(df))
+  
+  # Filter palettes to include only those that match kingdoms in the df
+  palettes <- palettes[names(palettes) %in% unique(df$Kingdom)]
+  
+  for (kingdom in names(palettes)) {
+    palette <- palettes[[kingdom]]
+    # Get indices of phyla in the current kingdom
+    indices <- which(df$Kingdom == kingdom)
+    # Order indices by Total_Reads
+    ordered_indices <- indices[order(-df$Total_Reads[indices])]
+    
+    # Check if there's only one entry for the kingdom
+    if (length(ordered_indices) == 1) {
+      # Assign the first color in the palette
+      colors[ordered_indices] <- palette[2]
+    } else {
+      # Ensure num_colors is at least 1
+      num_colors <- max(1, min(length(ordered_indices), length(palette) - 1))
+      # Start assigning colors from the second color in the palette
+      colors[ordered_indices[1:num_colors]] <- palette[2:(num_colors + 1)]
+      # If there are more phyla than colors, assign the last color to the extra phyla
+      if (length(ordered_indices) > num_colors) {
+        colors[ordered_indices[(num_colors + 1):length(ordered_indices)]] <- palette[length(palette)]
+      }
+    }
+  }
+  
+  # Assign the colors vector to the Color column in the dataframe
+  df$Color <- colors
+  return(df)
+}
+
+# Apply the function to assign colors
+Hsvs.contaminants.K.P.R <- assign_colors(Hsvs.contaminants.K.P.R, kingdom_color_palettes)
+
+# For the outer circle, select a representative color for each Kingdom
+kingdom_representative_colors <- sapply(names(kingdom_color_palettes), function(k) {
+  palette <- kingdom_color_palettes[[k]]
+  return(palette[1]) # Select the first color of the palette
+})
+
+kingdom_sums$Colors <- unlist(kingdom_representative_colors[
+  match(kingdom_sums$Kingdom, names(kingdom_representative_colors))])
+
+kingdom_sums_reversed<-t(kingdom_sums)
+
+kingdom_sums_reversed<-data.frame(kingdom_sums_reversed[,2],kingdom_sums_reversed[,1])
+
+kingdom_sums_reversed<-as.data.frame(t(kingdom_sums_reversed))
+
+# Reorder the dataframe within each kingdom based on Total_Reads
+Hsvs.contaminants.K.P.R <- Hsvs.contaminants.K.P.R %>%
+  arrange(Kingdom, Total_Reads)
+
+p <- plot_ly() %>%
+  add_trace(data = Hsvs.contaminants.K.P.R, labels = ~Phylum,
+            values = ~Total_Reads, type = 'pie', name = 'Phylum',
+            domain = list(x = c(0.15, 0.85), y = c(0.15, 0.85)),
+            sort = TRUE, textinfo = 'none',
+            marker = list(colors = ~Color,
+                          line = list(color = 'white', width = 0.5)),
+            showlegend = TRUE) %>%
+  add_trace(data = kingdom_sums_reversed, labels = ~Kingdom,
+            values = ~Kingdom_Total_Reads, type = 'pie', name = 'Kingdom',
+            domain = list(x = c(0, 1), y = c(0, 1)), hole = 0.8,
+            sort = FALSE, textinfo="label+percent",marker = list(
+              colors = ~ Colors, 
+              line = list(color = 'white', width = 2)),showlegend=TRUE) %>%
+  layout(
+    title = list(text = '<b>Contaminants</b>', font = list(size = 18),x=0.325),
+    margin = list(t = 80))
+
+```
+
+#### pie
+
+```{r}
+p
+```
+
+#### barplot
+
+```{r}
+Hsvs.contaminants.K.P.R.barplot <- Hsvs.contaminants.K.P.R %>%
+  arrange(Kingdom, desc(Total_Reads))
+
+# ggplot2
+barplot <- ggplot(Hsvs.contaminants.K.P.R.barplot, aes(x = reorder(Phylum, Total_Reads),
+                                               y = Total_Reads, fill = Color)) +
+  geom_bar(stat = "identity",width = 0.67) +
+  scale_fill_manual(values = Hsvs.contaminants.K.P.R$Color) +
+  scale_fill_identity() +
+  theme_classic() +
+  labs(title = "Contaminants by Phylum", x = "Phylum", y = "Total Reads") +
+  coord_flip() + 
+  theme(legend.position = "none")
+
+barplot
+```
+
+# Bacteria filtering
+
+```{r,echo=FALSE}
+## Bacteria
+HSvs.bacteria.nd<-HSvs.n.dec%>%
+  subset_taxa(Kingdom=="Bacteria")
+
+# remove the blank
+HSvs.Bacteria<-HSvs.bacteria.nd%>%
+  subset_samples(is_blank==FALSE)%>%
+  prune_false_positives()
+
+```
+
+# Alpha and Beta diversities
+
+## Alpha d.
+
+```{r}
+# Shannon 
+Shannon_general<-alpha_diversity_plot(HSvs.Bacteria,"category",
+                                      labels_legend = c("Healthy","MS"))
+```
+
+```{r}
+# Simpson
+Simpson_general_plot<-alpha_diversity_plot(HSvs.Bacteria,"category","Simpson",
+                                           labels_legend = c("Healthy","MS"))
+
+```
+
+### Wilxonson test
+
+```{r}
+
+# Shannon,Simpson wilxonson test p values
+Shannon_values<-run_diversity_analysis(HSvs.Bacteria,"Shannon")
+Simpson_values<-run_diversity_analysis(HSvs.Bacteria,"Simpson")
+
+
+```
+
+### Age_percentile, BMI_class and sex by category
+
+```{r,fig.show="hold", out.width="50%"}
+# Age percentile
+Shannon_b.vs.cat_age_plot<-alpha_diversity_plot(HSvs.Bacteria,"age_percentile")
+Shannon_b.vs.cat_age_plot<-alpha_diversity_plot(HSvs.Bacteria,"age_percentile",
+                                                Diversity = "Simpson")
+```
+
+#### ANOVA TEST
+
+```{r}
+Sample_data_alpha<-data.frame(sample_data(HSvs.Bacteria))
+Sample_data_alpha$age_percentile <- as.double(as.factor(
+  as.character(Sample_data_alpha$age_percentile)))
+result <- aov(age_percentile ~ category, data = Sample_data_alpha)
+results_ANOVA<-tidy(result)
+results_ANOVA
+```
+
+
+```{r,fig.show="hold", out.width="50%"}
+# BMI
+Shannon_b.vs.cat_BMI_plot<-alpha_diversity_plot(HSvs.Bacteria,"BMI_class")
+Shannon_b.vs.cat_BMI_plot<-alpha_diversity_plot(HSvs.Bacteria,"BMI_class",
+                                                Diversity = "Simpson")
+```
+
+```{r,fig.show="hold", out.width="50%"}
+# Sex
+Shannon_b.vs.cat_sex_plot<-alpha_diversity_plot(HSvs.Bacteria,"sex")
+Shannon_b.vs.cat_sex_plot<-alpha_diversity_plot(HSvs.Bacteria,"sex",
+                                                Diversity = "Simpson")
+```
+
+### Same but by Bolum_Intake
+
+```{r,fig.show="hold", out.width="50%"}
+# Age percentile
+coloring<-c("Blues","Reds","Greens")
+Shannon_b.vs.cat_age_plot<-alpha_diversity_plot(HSvs.Bacteria,"age_percentile",
+                                                major_group_col = "Bolum_Intake",
+                                                color = coloring)
+Simpson_b.vs.cat_age_plot<-alpha_diversity_plot(HSvs.Bacteria,"age_percentile",
+                                                major_group_col = "Bolum_Intake",
+                                                Diversity = "Simpson",color = coloring)
+```
+
+```{r,fig.show="hold", out.width="50%"}
+# BMI
+Shannon_b.vs.cat_BMI_plot<-alpha_diversity_plot(HSvs.Bacteria,"BMI_class",
+                                                major_group_col = "Bolum_Intake",
+                                                color = coloring)
+Simpson_b.vs.cat_BMI_plot<-alpha_diversity_plot(HSvs.Bacteria,"BMI_class",
+                                                major_group_col = "Bolum_Intake",
+                                                Diversity = "Simpson",color = coloring)
+```
+
+```{r,fig.show="hold", out.width="50%"}
+# Sex
+Shannon_b.vs.cat_sex_plot<-alpha_diversity_plot(HSvs.Bacteria,"sex",
+                                                major_group_col = "Bolum_Intake",
+                                                omit.main = "healthy",color = coloring)
+Shannon_b.vs.cat_sex_plot<-alpha_diversity_plot(HSvs.Bacteria,"sex",
+                                                major_group_col = "Bolum_Intake",
+                                                Diversity = "Simpson",
+                                                omit.main = "healthy",color = coloring)
+```
+## Beta d.
+
+```{r}
+# sample data
+sample_data_beta<-data.frame(sample_data(HSvs.Bacteria))
+
+# Distance Beta d
+distance_matrix <- phyloseq::distance(HSvs.Bacteria, method = "bray")
+
+# PCoA
+ordination_results <- ordinate(HSvs.Bacteria, method = "PCoA", distance = distance_matrix)
+
+ordination_df <- plot_ordination(HSvs.Bacteria, ordination_results, justDF = TRUE)
+
+# ID 
+ordination_df$id <- rownames(ordination_df)
+
+# merge with sample
+merged_df <- merge(ordination_df, sample_data_beta, by = "id")
+```
+
+### Category
+
+```{r}
+# Visualization Beta by Bolum_Intake coloring
+ggplot(merged_df, aes(x = Axis.1, y = Axis.2, color = category.x)) +
+  scale_color_manual(values = c("blue", "red"))+
+  geom_point(size = 3) +
+  stat_ellipse(aes(group = category.x), geom = "polygon", alpha = 0.1) +
+  labs(title = "Beta Diversity (PCoA with Bray-Curtis Distance)",
+       x = paste("PCoA 1 - ", round(ordination_results$values$Relative_eig[1] * 100, 2), "%", sep=""),
+       y = paste("PCoA 2 - ", round(ordination_results$values$Relative_eig[2] * 100, 2), "%", sep="")) +
+   labs(color = "Category")+
+  theme_minimal() +
+  theme(legend.title = element_text(size = 10), legend.text = element_text(size = 8))
+```
+
+### Bolum_Intake
+
+```{r}
+# Visualization Beta by Bolum_Intake coloring
+ggplot(merged_df, aes(x = Axis.1, y = Axis.2, color = Bolum_Intake.x)) +
+  scale_color_manual(values = c("blue", "red","olivedrab3"))+
+  geom_point(size = 3) +
+  stat_ellipse(aes(group = Bolum_Intake.x), geom = "polygon", alpha = 0.1) +
+  labs(title = "Beta Diversity (PCoA with Bray-Curtis Distance)",
+       x = paste("PCoA 1 - ", round(ordination_results$values$Relative_eig[1] * 100, 2), "%", sep=""),
+       y = paste("PCoA 2 - ", round(ordination_results$values$Relative_eig[2] * 100, 2), "%", sep="")) +
+  labs(color = "Bolum_Intake")+
+  theme_minimal() +
+  theme(legend.title = element_text(size = 10), legend.text = element_text(size = 8))
+```
+
+# Median Pre-DeSeq filtering
+
+```{r,echo=FALSE}
+# remove median before deseq
+pre_HSvs.Bacteria<-HSvs.Bacteria
+median_pre_HSvs.Bacteria<-pre_HSvs.Bacteria%>%
+  taxa_plus_otu_median("Species")
+
+# median shenanigans
+median_pre_HSvs.Bacteria<-median_pre_HSvs.Bacteria[
+  median_pre_HSvs.Bacteria[,"Reads_median"]>20,]
+
+# vectorize
+surviving_species<-median_pre_HSvs.Bacteria$Species
+
+# Otus
+Otu_rows<-HSvs.Bacteria@otu_table@.Data[
+  HSvs.Bacteria@tax_table@.Data[,"Species"]%in%surviving_species,]
+
+# subset
+pre_HSvs.Bacteria_subset <- prune_taxa(rownames(Otu_rows),HSvs.Bacteria)
+```
+
+# 2nd Normalization
+
+## reference level
+
+```{r,echo=FALSE}
+# separate otu and sample
+pre_HSvs_B_otu<-data.frame(otu_table(pre_HSvs.Bacteria_subset))
+pre_HSvs_B_sam<-data.frame(sample_data(pre_HSvs.Bacteria_subset))
+
+# Ensure "healthy" is the reference level
+pre_HSvs_B_sam$category <- relevel(
+  as.factor(pre_HSvs_B_sam$category), ref = "HEALTHY")
+
+# reintegrate into phyloseq
+sample_data(pre_HSvs.Bacteria_subset)<-pre_HSvs_B_sam
+```
+
+```{r}
+# Set BMI_class as numeric factor
+New_bmi_classes<-c(labels.3,"none")
+pre_HSvs_B_sam<-data.frame(sample_data(pre_HSvs.Bacteria_subset))
+pre_HSvs_B_sam$BMI_class<-as.character(pre_HSvs_B_sam$BMI_class)
+pre_HSvs_B_sam$BMI_class<-ifelse(is.na(pre_HSvs_B_sam$BMI_class)==TRUE,"none",
+                                 pre_HSvs_B_sam$BMI_class)
+pre_HSvs_B_sam$BMI_class<-as.factor(as.double(factor(
+  pre_HSvs_B_sam$BMI_class,levels=New_bmi_classes)))
+
+```
+
+## Simple Wald test (correct significant to padj < 0.05)
+
+```{r}
+dds_wald_category <- DESeqDataSetFromMatrix(
+  countData = pre_HSvs_B_otu,
+  colData = pre_HSvs_B_sam,
+  design = ~ category
+)
+
+# Run the differential expression analysis
+dds_wald_category <- DESeq(dds_wald_category)
+
+# results
+dds_wald_category<-results(dds_wald_category,
+                               contrast=c("category","MS","HEALTHY"))
+```
+
+## volcano plot for significant species
+
+```{r,echo=FALSE}
+# Create a dataframe for plotting
+Wald_df <- data.frame(
+  log2FoldChange = dds_wald_category$log2FoldChange,
+  padj = dds_wald_category$padj
+)
+
+# Replace infinite values with NA for plotting
+Wald_df$log2FoldChange[is.infinite(Wald_df$log2FoldChange)] <- NA
+
+# Create the volcano plot
+
+# Create a variable for the region of interest
+Wald_df$region <- ifelse((Wald_df$padj < 0.05),"padj < 0.05", "other")
+
+# Create the volcano plot
+z<-ggplot(Wald_df, aes(x = log2FoldChange, y = -log10(padj), color = region)) +
+  geom_point(alpha = 0.4) +
+  scale_color_manual(values = c("padj < 0.05" = "red", "other" = "black")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +  # horizontal line at -log10(padj) = 0.05
+  geom_vline(xintercept = 0, linetype = "dashed", color = "blue")+
+  theme_bw() +
+  labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value", color = "Species") +
+  ggtitle("Statistically significant species by WALD category")
+
+```
+
+```{r}
+z
+```
+
+#### filter for padj for significant species
+
+```{r}
+# padj
+significant_dds_wald_category <- dds_wald_category[which(dds_wald_category$padj < 0.05), ]
+
+# Subset the HSvs by significant species
+HSvs.Bacteria_wald_category <- prune_taxa(rownames(
+  significant_dds_wald_category), pre_HSvs.Bacteria_subset)
+
+report_phyloseq_data_by_category(HSvs.Bacteria_wald_category)
+
+HSvs.Bacteria_wald_category_total<-HSvs.Bacteria_wald_category%>%
+  taxa_plus_otu_median("Species")
+HSvs.Bacteria_wald_category_total<-HSvs.Bacteria_wald_category_total[
+  HSvs.Bacteria_wald_category_total[,"Species"]>0,
+]
+```
+## LRT
+
+```{r}
+# Create a DESeqDataSet object
+dds_HSvs_B_category <- DESeqDataSetFromMatrix(
+  countData = pre_HSvs_B_otu,
+  colData = pre_HSvs_B_sam,
+  design = ~ category + BMI_class + age_percentile + sex + operator_element
+)
+
+# Run the differential expression analysis
+dds_HSvs_B_category <- DESeq(dds_HSvs_B_category, test = "LRT",
+                    reduced = ~ BMI_class + age_percentile + sex + operator_element)
+
+# results
+res.HSvs.Bacteria_cat<-results(dds_HSvs_B_category,independentFiltering=TRUE)
+```
+
+# Filter data for significant species
+
+## volcano plot for significant species
+
+```{r,echo=FALSE}
+# Create a dataframe for plotting
+plot_df <- data.frame(
+  log2FoldChange = res.HSvs.Bacteria_cat$log2FoldChange,
+  padj = res.HSvs.Bacteria_cat$padj
+)
+
+# Replace infinite values with NA for plotting
+plot_df$log2FoldChange[is.infinite(plot_df$log2FoldChange)] <- NA
+
+# Create the volcano plot
+
+# Create a variable for the region of interest
+plot_df$region <- ifelse((plot_df$padj < 0.05),"padj < 0.05", "other")
+
+# Create the volcano plot
+a<-ggplot(plot_df, aes(x = log2FoldChange, y = -log10(padj), color = region)) +
+  geom_point(alpha = 0.4) +
+  scale_color_manual(values = c("padj < 0.05" = "red", "other" = "black")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +  # horizontal line at -log10(padj) = 0.05
+  geom_vline(xintercept = 0, linetype = "dashed", color = "blue")+
+  theme_bw() +
+  labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value", color = "Species") +
+  ggtitle("Statistically significant species by LRT category")
+
+```
+
+```{r}
+a
+```
+
+#### filter for padj for significant species
+
+```{r}
+# padj
+significant_category <- res.HSvs.Bacteria_cat[
+  which(res.HSvs.Bacteria_cat$padj < 0.05), ]
+
+# Subset the HSvs by significant species
+HSvs.Bacteria_category <- prune_taxa(rownames(
+  significant_category), pre_HSvs.Bacteria_subset)
+
+report_phyloseq_data_by_category(HSvs.Bacteria_category)
+
+HSvs.Bacteria_general_LRT<-HSvs.Bacteria_category%>%
+  taxa_plus_otu_median("Species")
+HSvs.Bacteria_general_LRT<-HSvs.Bacteria_general_LRT[
+  HSvs.Bacteria_general_LRT[,"Species"]>0,]
+```
+
+## Species removed by removing elementss of disturb (ADD TABLE OF NOISE)
+
+```{r}
+# Subset the HSvs by significant species
+HSvs.Bacteria_category_non_Noise <- prune_taxa(rownames(
+  HSvs.Bacteria_category@tax_table) , HSvs.Bacteria_wald_category)
+
+Non_noise_species<-rownames(tax_table(HSvs.Bacteria_category_non_Noise))
+total_wald_species<-rownames(tax_table(HSvs.Bacteria_wald_category))
+Noise_species<-total_wald_species[!total_wald_species%in%Non_noise_species]
+HSvs.Bacteria_category_Noise<-prune_taxa(Noise_species,HSvs.Bacteria_wald_category)
+
+report_phyloseq_data_by_category(HSvs.Bacteria_category_Noise)
+
+Noise<-HSvs.Bacteria_category_Noise%>%
+  taxa_plus_otu_median("Species")
+Noise<-Noise[Noise[,"Reads_median"]>0,]
+
+```
+
+## Suspect other factor, specified data for Bolum_Intake and operator element
+
+```{r}
+report_phyloseq_data_by_category(pre_HSvs.Bacteria_subset,"Bolum_Intake")
+report_phyloseq_data_by_category(pre_HSvs.Bacteria_subset,"operator_element")
+```
+```{r}
+# check correlation between the 2
+# Create a cross-tabulation of sequencing batch and Bolum_Intake therapy
+cross_tab <- table(pre_HSvs_B_sam$operator_element, pre_HSvs_B_sam$Bolum_Intake)
+
+# Print the cross-tabulation
+print(cross_tab)
+```
+# LRT for Bolum_intake negative vs healthy
+
+```{r}
+# reform phyloseq
+LRT_phyloseq<-merge_phyloseq(otuTable(as.matrix(pre_HSvs_B_otu),taxa_are_rows=TRUE),
+                             tax_table(as.matrix(tax_table(pre_HSvs.Bacteria_subset))),
+                             sample_data(sample_data(pre_HSvs.Bacteria_subset)))
+
+#### no positive Bolum_Intake, category LRT
+No_Bolum_Intake_pos<-LRT_phyloseq%>%
+  subset_samples(Bolum_Intake!="positive")%>%
+  prune_false_positives()
+
+No_Bolum_Intake_p_sam<-data.frame(sample_data(No_Bolum_Intake_pos))
+No_Bolum_Intake_p_otu<-data.frame(otu_table(No_Bolum_Intake_pos))
+
+No_Bolum_Intake_p_sam$BMI_class<-as.character(No_Bolum_Intake_p_sam$BMI_class)
+No_Bolum_Intake_p_sam$BMI_class<-ifelse(is.na(No_Bolum_Intake_p_sam$BMI_class)==TRUE,
+                                        "none",No_Bolum_Intake_p_sam$BMI_class)
+No_Bolum_Intake_p_sam$BMI_class<-as.factor(as.double(factor(
+  No_Bolum_Intake_p_sam$BMI_class,levels=New_bmi_classes)))
+
+# Create a DESeqDataSet object
+No_Bolum_Intake_p <- DESeqDataSetFromMatrix(
+  countData = No_Bolum_Intake_p_otu,
+  colData = No_Bolum_Intake_p_sam,
+  design = ~ Bolum_Intake + BMI_class + age_percentile + sex 
+)
+
+# Run the differential expression analysis
+No_Bolum_Intake_p <- DESeq(No_Bolum_Intake_p, test = "LRT",
+                     reduced = ~ BMI_class + age_percentile + sex )
+
+# results
+no_Bolum_Intake_pos<-results(No_Bolum_Intake_p,independentFiltering=TRUE)
+
+```
+
+
+# LRT for Bolum_Intake pos vs healthy
+
+```{r}
+### Bolum_Intake
+
+Pos.vs.healthy<-LRT_phyloseq%>%
+  subset_samples(Bolum_Intake!="negative")%>%
+  prune_false_positives()
+
+Bolum_Intake_p_sam<-data.frame(sample_data(Pos.vs.healthy))
+Bolum_Intake_p_otu<-data.frame(otu_table(Pos.vs.healthy))
+
+Bolum_Intake_p_sam$BMI_class<-as.character(Bolum_Intake_p_sam$BMI_class)
+Bolum_Intake_p_sam$BMI_class<-ifelse(is.na(Bolum_Intake_p_sam$BMI_class)==TRUE,
+                                        "none",Bolum_Intake_p_sam$BMI_class)
+Bolum_Intake_p_sam$BMI_class<-as.factor(as.double(factor(
+  Bolum_Intake_p_sam$BMI_class,levels=New_bmi_classes)))
+
+# Create a DESeqDataSet object
+dds_HSvs_B_Bolum_Intake_pos <- DESeqDataSetFromMatrix(
+  countData = Bolum_Intake_p_otu,
+  colData = Bolum_Intake_p_sam,
+  design = ~ Bolum_Intake + BMI_class + age_percentile + sex + operator_element
+)
+
+# Run the differential expression analysis
+dds_HSvs_B_Bolum_Intake_pos <- DESeq(dds_HSvs_B_Bolum_Intake_pos, test = "LRT",
+                             reduced = ~ BMI_class + age_percentile + sex +
+                               operator_element)
+
+# results
+res.HSvs.Bacteria_Bolum_Intake_POS<-results(dds_HSvs_B_Bolum_Intake_pos,
+                                            independentFiltering=TRUE)
+
+```
+
+
+```{r,echo=FALSE}
+# Create a dataframe for plotting
+plot_df_Bolum_Intake <- data.frame(
+  log2FoldChange = no_Bolum_Intake_pos$log2FoldChange,
+  padj = no_Bolum_Intake_pos$padj
+)
+
+# Replace infinite values with NA for plotting
+plot_df_Bolum_Intake$log2FoldChange[is.infinite(plot_df_Bolum_Intake$log2FoldChange)] <- NA
+
+# Create the volcano plot
+
+# Create a variable for the region of interest
+plot_df_Bolum_Intake$region <- ifelse((plot_df_Bolum_Intake$padj < 0.05),"padj < 0.05", "other")
+
+# Create the volcano plot
+b<- ggplot(plot_df_Bolum_Intake, aes(x = log2FoldChange, y = -log10(padj), color = region)) +
+  geom_point(alpha = 0.4) +
+  scale_color_manual(values = c("padj < 0.05" = "red", "other" = "black")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +  # horizontal line at -log10(padj) = 0.05
+  geom_vline(xintercept = 0, linetype = "dashed", color = "blue")+
+  theme_bw() +
+  labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value", color = "Species") +
+  ggtitle("Statistically significant species by Bolum_Intake negative vs healthy")
+```
+
+```{r,echo=FALSE}
+# Create a dataframe for plotting
+plot_df_sb <- data.frame(
+  log2FoldChange = res.HSvs.Bacteria_Bolum_Intake_POS$log2FoldChange,
+  padj = res.HSvs.Bacteria_Bolum_Intake_POS$padj
+)
+
+# Replace infinite values with NA for plotting
+plot_df_sb$log2FoldChange[is.infinite(plot_df_sb$log2FoldChange)] <- NA
+
+# Create the volcano plot
+
+# Create a variable for the region of interest
+plot_df_sb$region <- ifelse((plot_df_sb$padj < 0.05),"padj < 0.05", "other")
+
+# Create the volcano plot
+d<-ggplot(plot_df_sb, aes(x = log2FoldChange, y = -log10(padj), color = region)) +
+  geom_point(alpha = 0.4) +
+  scale_color_manual(values = c("padj < 0.05" = "red", "other" = "black")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +  # horizontal line at -log10(padj) = 0.05
+  geom_vline(xintercept = 0, linetype = "dashed", color = "blue")+
+  theme_bw() +
+  labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value", color = "Species") +
+  ggtitle("Statistically significant species by Bolum_Intake positive vs healthy")
+```
+
+
+```{r,fig.show="hold", out.width="50%"}
+print(b)
+print(d)
+```
+
+#### filter for padj for significant species
+
+```{r}
+# padj
+significant_BI_NEG <- no_Bolum_Intake_pos[
+  which(no_Bolum_Intake_pos$padj < 0.05), ]
+
+# Subset the HSvs by significant species
+HSvs.Bacteria_BI_NEG <- prune_taxa(rownames(
+  significant_BI_NEG), No_Bolum_Intake_pos)
+
+# padj
+significant_BI_POS <- res.HSvs.Bacteria_Bolum_Intake_POS[
+  which(res.HSvs.Bacteria_Bolum_Intake_POS$padj < 0.05), ]
+
+# Subset the HSvs by significant species
+HSvs.Bacteria_BI_POS <- prune_taxa(rownames(
+  significant_BI_POS), Pos.vs.healthy)
+# taxa + Median
+BI_NEG<-HSvs.Bacteria_BI_NEG%>%
+  taxa_plus_otu_median("Species")
+BI_NEG<-BI_NEG[BI_NEG[,"Reads_median"]>0,]
+BI_POS<-HSvs.Bacteria_BI_POS%>%
+  taxa_plus_otu_median("Species")
+BI_POS<-BI_POS[BI_POS[,"Reads_median"]>0,]
+
+
+```
+
+# Positive vs Negative Bolum_Intake, is the Bolum_Intake creating differences?
+
+```{r,echo=FALSE}
+#### no positive Bolum_Intake, category LRT
+No_Bolum_Intake_healthy<-LRT_phyloseq%>%
+  subset_samples(Bolum_Intake!="healthy")%>%
+  prune_false_positives()
+
+No_Bolum_Intake_h_sam<-data.frame(sample_data(No_Bolum_Intake_healthy))
+No_Bolum_Intake_h_otu<-data.frame(otu_table(No_Bolum_Intake_healthy))
+
+No_Bolum_Intake_h_sam$BMI_class<-as.character(No_Bolum_Intake_h_sam$BMI_class)
+No_Bolum_Intake_h_sam$BMI_class<-ifelse(is.na(No_Bolum_Intake_h_sam$BMI_class)==TRUE,
+                                        "none",No_Bolum_Intake_h_sam$BMI_class)
+No_Bolum_Intake_h_sam$BMI_class<-as.factor(as.double(factor(
+  No_Bolum_Intake_h_sam$BMI_class,levels=New_bmi_classes)))
+```
+
+```{r}
+# Create a DESeqDataSet object
+No_Bolum_Intake_h <- DESeqDataSetFromMatrix(
+  countData = No_Bolum_Intake_h_otu,
+  colData = No_Bolum_Intake_h_sam,
+  design = ~ Bolum_Intake + BMI_class + age_percentile + sex 
+)
+
+# Run the differential expression analysis
+No_Bolum_Intake_h <- DESeq(No_Bolum_Intake_h, test = "LRT",
+                     reduced = ~ BMI_class + age_percentile + sex )
+
+# results
+no_Bolum_Intake_h<-results(No_Bolum_Intake_h,independentFiltering=TRUE)
+```
+
+```{r,echo=FALSE}
+# Create a dataframe for plotting
+plot_df <- data.frame(
+  log2FoldChange = no_Bolum_Intake_h$log2FoldChange,
+  padj = no_Bolum_Intake_h$padj
+)
+
+# Replace infinite values with NA for plotting
+plot_df$log2FoldChange[is.infinite(plot_df$log2FoldChange)] <- NA
+
+# Create the volcano plot
+
+# Create a variable for the region of interest
+plot_df$region <- ifelse((plot_df$padj < 0.05),"padj < 0.05", "other")
+
+# Create the volcano plot
+f<-ggplot(plot_df, aes(x = log2FoldChange, y = -log10(padj), color = region)) +
+  geom_point(alpha = 0.4) +
+  scale_color_manual(values = c("padj < 0.05" = "red", "other" = "black")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +  # horizontal line at -log10(padj) = 0.05
+  geom_vline(xintercept = 0, linetype = "dashed", color = "blue")+
+  theme_bw() +
+  labs(x = "Log2 Fold Change", y = "-Log10 Adjusted P-Value", color = "Species") +
+  ggtitle("Statistically significant species (Pos. vs Neg. Bolum_Intake)")
+```
+
+```{r}
+print(f)
+```
+
+#### filter for padj for significant species (ADD TABLE)
+
+```{r}
+# padj
+significant_species.no.h <- no_Bolum_Intake_h[which(no_Bolum_Intake_h$padj < 0.05), ]
+
+# Subset the HSvs by significant species
+HSvs.Bacteria_no.h <- prune_taxa(rownames(
+  significant_species.no.h), No_Bolum_Intake_healthy)
+
+report_phyloseq_data(HSvs.Bacteria_no.h)
+
+no.h_median<-HSvs.Bacteria_no.h%>%
+  taxa_plus_otu_median("Species")
+no.h_median<-no.h_median[no.h_median[,"Reads_median"]>0,]
+
+```
+
+
+
+
+
+# Bolum_intake table for differences, comparing NEG vs POS with POS vs H, NEG vs H and NOISE
+
+```{r}
+### recap
+df1<-Noise
+df2<-BI_NEG
+df3<-BI_POS
+df4<-no.h_median
+```
+
+# Venn intersections
+
+```{r}
+# Extract the Species columns from each data frame
+species1 <- df2$Species
+species2 <- df3$Species
+species3 <- df4$Species
+
+# Create a list of these species vectors
+input <- list("Negative vs Healthy" = species1,
+              "Positive vs Healthy" = species2,
+              "Negative vs Positive" = species3)
+
+
+# Create the Venn diagram
+p <- ggvenn(input)
+
+# Customize the colors with scale_fill_manual()
+p <- p + scale_fill_manual(values = c("red", "green", "yellow"))
+
+print(p)
+```
+
+
+
+# Zoom Plots (Neg v Pos, Pos v H, Neg v Pos)
+
+```{r}
+
+### matching zooms
+
+df2$Species <- gsub(" ", "_", df2$Species)
+df3$Species <- gsub(" ", "_", df3$Species)
+df4$Species <- gsub(" ", "_", df4$Species)
+Match_list<-list(df2,df3,df4)
+combined_final<- Sum_Process_taxa_Presence(Match_list)
+final_bolum_match<- Filter_by_match(combined_final,Match_list,Operation="==")
+final_bolum_mismatch<- Filter_by_match(combined_final,Match_list,Operation="!=")
+
+b.match<-zoom_list_matches(final_bolum_mismatch)
+b.nh<-zoom_list_zoom_bars(
+  b.match[[1]],dye=healthy_dye,text_Reads_sum = "Reads_median",
+  Title_text = "Bolum_Intake negative vs healthy" )
+b.ph<-zoom_list_zoom_bars(
+  b.match[[2]],dye=pos_dye,text_Reads_sum = "Reads_median",
+  Title_text = "Bolum_Intake positive vs healthy")
+b.pn<-zoom_list_zoom_bars(
+  b.match[[3]],dye=last_dye,text_Reads_sum = "Reads_median",
+  Title_text = "Bolum_Intake positive vs negative")
+
+print(b.nh[[1]])
+print(b.nh[[2]])
+print(b.ph[[1]])
+print(b.ph[[2]])
+print(b.ph[[3]])
+print(b.pn[[1]])
+print(b.pn[[2]])
+print(b.pn[[3]])
+```
+
+
+# Bolum_intake table for differences, comparing NEG vs POS with POS vs H, NEG vs H and NOISE
+
+```{r}
+all_species <- unique(c( df3$Species, df4$Species))
+
+# Create a data frame
+df <- data.frame(Species = all_species)
+
+df <- df %>%
+  mutate(color = case_when(
+    Species %in% df1$Species ~ "bisque2",
+    Species %in% df3$Species & Species %in% df4$Species ~ "olivedrab2",
+    Species %in% df3$Species & !Species %in% df4$Species ~ "olivedrab",
+    Species %in% df2$Species ~ "tomato2",
+    TRUE ~ "white"
+  ))
+
+n <- nrow(df)
+rows_per_group <- ceiling(n / 7)
+
+df_list <- split(df, ceiling(seq_along(df$Species) / rows_per_group))
+
+df_list <- lapply(df_list, function(x) {
+  if (nrow(x) < rows_per_group) {
+    to_add <- rows_per_group - nrow(x)
+    x <- rbind(x, data.frame(Species = rep(".", to_add), color = rep("white", to_add)))
+  }
+  x
+})
+
+df_final <- do.call(cbind, df_list)
+
+# Initialize an empty list to store the locations
+locations_list <- list()
+combined_locations <- list()
+
+# Specify the colors you're interested in
+colors <- unique(df$color)
+
+# Loop over the colors
+for(color in colors) {
+  # Loop over the 5 pairs of Species and color columns
+  for(i in 1:7) {
+    # Create the column names
+    species_col <- rlang::sym(paste(i, "Species", sep = "."))
+    color_col <- rlang::sym(paste(i, "color", sep = "."))
+    
+    # Find the rows where color is the current color
+    color_rows <- which(df_final[,rlang::as_string(color_col)] == color)
+    
+    # Create the locations and add them to the list
+    locations_list[[paste(color, i)]] <- cells_body(columns = !!species_col, rows = !!color_rows)
+  }
+  
+  # Combine locations from all columns for each color
+  combined_locations[[color]] <- lapply(1:7, function(i) locations_list[[paste(color, i)]])
+}
+
+gt_table <- df_final %>%
+  gt() %>%
+  tab_footnote(
+    footnote = "Noise",
+    locations = combined_locations[["bisque2"]]
+  ) %>%
+  tab_footnote(
+    footnote = "Neg vs Healthy",
+    locations = combined_locations[["tomato2"]]
+  ) %>%
+  tab_footnote(
+    footnote = "Pos vs Healthy in Neg vs Pos",
+    locations = combined_locations[["olivedrab2"]]
+  )%>%
+  tab_footnote(
+    footnote = "Pos vs Healthy only",
+    locations = combined_locations[["olivedrab"]]
+  )
+for(color in colors){
+gt_table <- gt_table %>%
+  tab_style(
+    style = cell_fill(adjustcolor(color,alpha.f = 0.3)),
+    locations = combined_locations[[color]]
+  )
+}
+
+
+gt_table <- gt_table %>%
+  tab_style(
+    style = cell_text(color = "black"),
+    locations = cells_body()
+  )%>%
+  cols_label(!!!setNames(rep(" ", ncol(df_final)), names(df_final)))%>%
+  cols_hide(columns = c(grep("color", names(df_final)),
+                        grep("footnote", names(df_final))))%>%
+  tab_header(
+    title = "Significant differentially expressed species",
+    subtitle = "LRT test between Positive and Healthy controls vs Positive and Negative Bolum_Intake"
+  )
+```
+
+```{r}
+# Print the table
+print(gt_table)
+
+```
+
+#PHEATMAP of Negative bolum vs healthy
+
+```{r}
+p_heatmap_pq<-pre_HSvs.Bacteria_subset%>%
+  subset_samples(Bolum_Intake!="positive")%>%
+  prune_false_positives()
+
+# padj
+significant_non_POS <- no_Bolum_Intake_pos[
+  which(no_Bolum_Intake_pos$padj < 0.05), ]
+
+# Subset the HSvs by significant species
+HSvs.Bacteria_non_POS <- prune_taxa(rownames(
+  significant_non_POS), p_heatmap_pq)
+```
+
+## set otu to z-scores
+
+```{r}
+# Z scorize
+HSvs.Bacteria_otu<-data.frame(otu_table(HSvs.Bacteria_non_POS))
+HSvs.Bacteria_otu_table_zscore <-data.frame(t(scale(t(HSvs.Bacteria_otu))))
+
+# integrate into physeq
+HSvs.Bacteria_subset_zscore<-HSvs.Bacteria_non_POS
+Otu_rows_zscored<-otu_table(as.matrix(HSvs.Bacteria_otu_table_zscore),
+                            taxa_are_rows=TRUE)
+otu_table(HSvs.Bacteria_subset_zscore)<-Otu_rows_zscored
+
+```
+
+```{r}
+# change rownames
+HSvs_B.tax<-data.frame(tax_table(HSvs.Bacteria_subset_zscore))
+HSvs_B.otu<-data.frame(otu_table(HSvs.Bacteria_subset_zscore))
+HSvs_B.otu<-data.frame(HSvs_B.otu)
+HSvs_B.tax<-data.frame(HSvs_B.tax)
+rownames(HSvs_B.tax)<-HSvs_B.tax$Species
+rownames(HSvs_B.otu)<-rownames(HSvs_B.tax)
+```
+
+## heatmap
+
+```{r}
+# create annotation
+HSvs_B.sam<-data.frame(sample_data(HSvs.Bacteria_subset_zscore))
+
+# Convert the family to a factor and then to numeric
+family <- as.numeric(factor(HSvs_B.tax$Family))
+
+# Create a distance matrix for family
+dist_matrix_rows <- dist(family)
+
+# Create a clustering based on the distance matrix
+clustering_rows <- hclust(dist_matrix_rows)
+
+```
+
+```{r}
+# filter annotations
+latest_HSvs_B.sam_annotation<-HSvs_B.sam%>%
+  select(c(sex,age_percentile,BMI_class,operator_element,Bolum_Intake))
+
+# clusterify
+# Convert factor to numeric
+latest_HSvs_B.sam_annotation$Bolum_Intake_num <- as.numeric(
+  factor(latest_HSvs_B.sam_annotation$Bolum_Intake))
+
+# Create a distance matrix for sequencing_batch_numeric
+dist_matrix_col <- dist(latest_HSvs_B.sam_annotation$Bolum_Intake_num)
+
+# Create a clustering based on the distance matrix
+clustering_col <- hclust(dist_matrix_col)
+
+# filter annotations
+latest_HSvs_B.sam_annotation<-latest_HSvs_B.sam_annotation%>%
+  select(-Bolum_Intake_num)
+# Create an annotation data frame with the family names
+annotation_row <- data.frame(Family = HSvs_B.tax$Family)
+rownames(annotation_row) <- rownames(HSvs_B.otu)
+
+color_list<-list(sex=c(M="skyblue",F="pink"),
+                 age_percentile=c(`19_30`="beige",
+                                  `30_40`="bisque2",
+                                  `40_56`="burlywood"),
+                 BMI_class=c(`Normal weight`="lavenderblush",
+                             `Below-Normal weight`="lavenderblush2",
+                             `Above-Normal weight`="lavenderblush3"),
+                 operator_element=c(`1-3`="greenyellow",
+                                    `4-5`="olivedrab3"),
+                 Bolum_Intake=c(healthy="blue",
+                                negative="red"))
+
+pheatmap(HSvs_B.otu, annotation_row = annotation_row,
+         annotation_col = latest_HSvs_B.sam_annotation,
+         cluster_cols = clustering_col,
+         cluster_rows = clustering_rows,
+         cutree_cols = length(unique(
+           latest_HSvs_B.sam_annotation$Bolum_Intake)),
+         cutree_rows = length(unique(HSvs_B.tax$Family)),
+         annotation_colors = color_list)
+```
+
+## median difference of expression
+
+```{r}
+Healthy_final<-HSvs.Bacteria_non_POS%>%
+  subset_samples(category=="HEALTHY")%>%
+  prune_false_positives()%>%
+  taxa_plus_otu_median("Species")
+Healthy_final<-Healthy_final[Healthy_final[,"Reads_median"]>0,]
+
+
+MS_final<-HSvs.Bacteria_non_POS%>%
+  subset_samples(category!="HEALTHY")%>%
+  prune_false_positives()%>%
+  taxa_plus_otu_median("Species")
+MS_final<-MS_final[MS_final[,"Reads_median"]>0,]
+
+```
+
+### percentages of differential expression of negative patients over 
+
+```{r}
+MS_expression<-percentages_over_control(MS_final,Healthy_final)
+
+MS_expression_table <- MS_expression %>%
+  gt()%>%
+  tab_header(
+    title = "Table of percentages of expression",
+    subtitle = "MS patients over healthy control by Negative Bolum_Intake vs healthy LRT"
+  )
+
+print(MS_expression_table)
+```
+
+### Full taxa
+
+```{r}
+Differential_taxas<-data.frame(tax_table(pre_HSvs.Bacteria_subset))
+Differential_taxas<-Differential_taxas[Differential_taxas[,"Species"]%in%
+                                         MS_expression$Species,]
+Full_differential_taxonomy<-Differential_taxas%>%
+  gt()%>%
+  tab_header(
+    title = "Taxonomy Table of Differential expressed species",
+    subtitle = " by Negative Bolum_Intake vs healthy LRT"
+  )
+print(Full_differential_taxonomy)
+```
+
